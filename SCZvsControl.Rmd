@@ -1,0 +1,494 @@
+---
+title: "SCZvsControl"
+author: "Xiangning Xue"
+date: '2022-06-08'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+```
+
+## prepare data
+```{r}
+meta = read.csv(paste0("data/CM_clinical_150_0514.csv"), row.names = 1)
+dat = read.csv(paste0("data/CM_filtered_log2CPM_Combat_150_0514.csv"), row.names = 1)
+
+meta.use = meta %>% filter(Dx=="SCZ"|matchIndex==1)
+table(meta.use$Dx, meta.use$Gender)
+dat.use = dat[, meta.use$DLPFC_RNA_Sequencing_Sample_ID]
+
+library(biomaRt)
+mart = useMart("ensembl")
+listDatasets(mart) %>% filter(grepl("hsapien", dataset)) #hsapiens_gene_ensembl
+mart = useDataset("hsapiens_gene_ensembl", mart)
+listAttributes(mart)%>% filter(grepl("symbol", name)) #hgnc_symbol
+listFilters(mart) %>% filter(grepl("ensembl", name)) #ensembl_gene_id
+gNameMatch = getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), 
+                   filters = "ensembl_gene_id", 
+                   values = rownames(dat.use), 
+                   mart)
+dim(gNameMatch)
+dim(dat.use)
+gNameMatch2 = gNameMatch %>% right_join(data.frame(ensembl_gene_id = rownames(dat.use), ensembl_gene_id_origin = rownames(dat.use)))
+gNameMatch2 = gNameMatch2[!duplicated(gNameMatch2$ensembl_gene_id), ]
+gNameMatch2$hgnc_symbol[is.na(gNameMatch2$hgnc_symbol)|gNameMatch2$hgnc_symbol==""] = gNameMatch2$ensembl_gene_id[is.na(gNameMatch2$hgnc_symbol)|gNameMatch2$hgnc_symbol==""]
+```
+
+## DCP 
+```{r}
+x1 = list(data = data.frame(dat.use[, meta.use$Dx =="Control"]), 
+          time = meta.use[meta.use$Dx =="Control", "Corrected.TOD"], 
+          gname = gNameMatch2$hgnc_symbol[match(rownames(dat.use), gNameMatch2$ensembl_gene_id_origin)])
+x2 = list(data = data.frame(dat.use[, meta.use$Dx =="SCZ"]), 
+          time = meta.use[meta.use$Dx =="SCZ", "Corrected.TOD"], 
+          gname = gNameMatch2$hgnc_symbol[match(rownames(dat.use), gNameMatch2$ensembl_gene_id_origin)])
+
+DCP_rhythm = DiffCircaPipeline::DCP_Rhythmicity(x1, x2, alpha = 0.05, alpha.FDR = 0.05)
+
+table(DCP_rhythm$rhythm.joint$TOJR)
+table(DCP_rhythm$rhythm.joint$TOJR.FDR)
+DCP_dparam = DiffCircaPipeline::DCP_DiffPar(DCP_rhythm, Par = "A&phase")
+DCP_dparam2 = DiffCircaPipeline::DCP_DiffPar(DCP_rhythm, Par = "phase")
+DCP_dparam3 = DiffCircaPipeline::DCP_DiffPar(DCP_rhythm, Par = "A")
+DCP_dR2 = DiffCircaPipeline::DCP_DiffR2(DCP_rhythm)
+DCP_dR2_perm = DiffCircaPipeline::DCP_DiffR2(DCP_rhythm, method = "permutation", nSampling = 1000, Sampling.save = "perm0.05", parallel.ncores = 20)
+plot(-log10(DCP_dR2$p.R2), -log10(DCP_dR2_perm$p.R2))
+abline(a = 0, b = 1, col = "red")
+# save(x1, x2, DCP_rhythm, DCP_dparam, DCP_dparam2, DCP_dR2, DCP_dR2_perm, file = paste0("DCP_output.rData"))
+```
+
+
+### outputs
+```{r, echo=FALSE}
+load("DCP_output.rData")
+
+a.TOJR = DCP_rhythm$rhythm.joint$TOJR
+tab.p = data.frame(cutoff = paste0("p-value < ", 0.05),
+                   RhyI = sum(a.TOJR=="rhyI"),
+                   RhyII = sum(a.TOJR=="rhyII"),
+                   RhyBoth = sum(a.TOJR=="both"),
+                   Arrhy = sum(a.TOJR=="arrhy"))
+a.TOJR = DCP_rhythm$rhythm.joint$TOJR.FDR
+tab.p = rbind.data.frame(tab.p, 
+                         data.frame(cutoff = paste0("q-value < ", 0.05),
+                   RhyI = sum(a.TOJR=="rhyI"),
+                   RhyII = sum(a.TOJR=="rhyII"),
+                   RhyBoth = sum(a.TOJR=="both"),
+                   Arrhy = sum(a.TOJR=="arrhy")))
+a.TOJR = DiffCircaPipeline::toTOJR(DCP_rhythm, method = "Sidak_FS", alpha = 0.1, adjustP = FALSE, parallel.ncores = 2)
+tab.p = rbind.data.frame(tab.p, 
+                         data.frame(cutoff = paste0("p-value < ", 0.1),
+                   RhyI = sum(a.TOJR=="rhyI"),
+                   RhyII = sum(a.TOJR=="rhyII"),
+                   RhyBoth = sum(a.TOJR=="both"),
+                   Arrhy = sum(a.TOJR=="arrhy")))
+a.TOJR = DiffCircaPipeline::toTOJR(DCP_rhythm, method = "Sidak_FS", alpha = 0.2, adjustP = TRUE, parallel.ncores = 2)
+tab.p = rbind.data.frame(tab.p, 
+                         data.frame(cutoff = paste0("q-value < ", 0.2),
+                   RhyI = sum(a.TOJR=="rhyI"),
+                   RhyII = sum(a.TOJR=="rhyII"),
+                   RhyBoth = sum(a.TOJR=="both"),
+                   Arrhy = sum(a.TOJR=="arrhy")))
+a.TOJR = DiffCircaPipeline::toTOJR(DCP_rhythm, method = "Sidak_FS", alpha = 0.3, adjustP = TRUE, parallel.ncores = 2)
+tab.p = rbind.data.frame(tab.p, 
+                         data.frame(cutoff = paste0("q-value < ", 0.3),
+                   RhyI = sum(a.TOJR=="rhyI"),
+                   RhyII = sum(a.TOJR=="rhyII"),
+                   RhyBoth = sum(a.TOJR=="both"),
+                   Arrhy = sum(a.TOJR=="arrhy")))
+tab.p2 = tab.p[c(1, 3, 4), ]
+colnames(tab.p2)[2] = "RhyI \n(Control)"
+colnames(tab.p2)[3] = "RhyII \n(SCZ)"
+
+pdf(paste0("Figures/TOJRtab.pdf"), width = 5)
+p<-gridExtra::tableGrob(tab.p2, rows = NULL)
+gridExtra::grid.arrange(p)
+dev.off()
+
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = DCP_dR2 %>% arrange(p.R2) %>%
+                                     filter(p.R2<0.05&delta.R2>0) %>% pull(gname),
+                                   Info1 = "Control", Info2 = "SCZ",
+                                   filename = paste0("Figures/scatter_dR2up.pdf"), file.height = 8, file.width = 16)
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = DCP_dR2 %>% arrange(p.R2) %>%
+                                     filter(p.R2<0.05&delta.R2<0) %>% pull(gname),
+                                   Info1 = "Control", Info2 = "SCZ",
+                                   filename = paste0("Figures/scatter_dR2down.pdf"), file.height = 8, file.width = 16)
+DiffCircaPipeline::DCP_PlotPeakDiff(DCP_rhythm, dPhase = DCP_dparam2)
+
+
+```
+
+
+### IPA
+```{r}
+df = data.frame(ID = background.genes,
+                R2up = as.numeric(background.genes %in% (DCP_dR2 %>% filter(p.R2<0.05&delta.R2>0) %>% pull(gname))),
+                R2down = as.numeric(background.genes %in% (DCP_dR2 %>% filter(p.R2<0.05&delta.R2<0) %>% pull(gname)))
+                )
+write.csv(df, paste0("IPA_Input/dR2.csv"), row.names = FALSE)
+
+df = data.frame(ID = background.genes,
+                R2up = as.numeric(background.genes %in% (DCP_dR2_perm %>% filter(p.R2<0.05&delta.R2>0) %>% pull(gname))),
+                R2down = as.numeric(background.genes %in% (DCP_dR2_perm %>% filter(p.R2<0.05&delta.R2<0) %>% pull(gname)))
+                )
+write.csv(df, paste0("IPA_Input/dR2_perm.csv"), row.names = FALSE)
+
+df = data.frame(ID = background.genes,
+                Control = as.numeric(!background.genes %in% (DCP_rhythm$rhythm.joint %>% filter(TOJR %in% c("rhyI", "both")) %>% pull(gname))),
+                SCZ = as.numeric(!background.genes %in% (DCP_rhythm$rhythm.joint %>% filter(TOJR %in% c("rhyII", "both")) %>% pull(gname)))
+                )
+write.csv(df, paste0("IPA_Input/TOJR0.05_TOJR.csv"), row.names = FALSE)
+
+#dR2 p<0.1
+df = data.frame(ID = background.genes,
+                R2up = as.numeric(background.genes %in% (DCP_dR2 %>% filter(p.R2<0.1&delta.R2>0) %>% pull(gname))),
+                R2down = as.numeric(background.genes %in% (DCP_dR2 %>% filter(p.R2<0.1&delta.R2<0) %>% pull(gname)))
+                )
+write.csv(df, paste0("IPA_Input/dR2_p0.1.csv"), row.names = FALSE)
+```
+
+### Pathway genes
+```{r}
+#LPS/IL-1 Mediated Inhibition of RXR Function
+LPS.genes = c("ACOX3","CAT","CYP2J2")
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = LPS.genes,
+                                   Info1 = "Control", Info2 = "SCZ",
+                                   filename = paste0("Figures/scatter_TOJR0.05_dR20.1_down_LPS.pdf"), file.height = 4, file.width = 8)
+Calcium.genes = c("CACNA1F", "HDAC8", "MYL6B", "NFATC4")
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = Calcium.genes,
+                                   Info1 = "Control", Info2 = "SCZ",
+                                   filename = paste0("Figures/scatter_TOJR0.05_dR20.1_up_calcium.pdf"), file.height = 4, file.width = 8)
+
+```
+
+
+## DCP with cutoff 0.1
+```{r}
+load("DCP_output.rData")
+DCP_rhythm = DiffCircaPipeline::DCP_Rhythmicity(x1, x2, alpha = 0.1, alpha.FDR = 0.1)
+
+table(DCP_rhythm$rhythm.joint$TOJR)
+table(DCP_rhythm$rhythm.joint$TOJR.FDR)
+DCP_dparam = DiffCircaPipeline::DCP_DiffPar(DCP_rhythm, Par = "A&phase")
+DCP_dparam2 = DiffCircaPipeline::DCP_DiffPar(DCP_rhythm, Par = "phase")
+DCP_dparam3 = DiffCircaPipeline::DCP_DiffPar(DCP_rhythm, Par = "M")
+DCP_dR2 = DiffCircaPipeline::DCP_DiffR2(DCP_rhythm)
+DCP_dR2_perm = DiffCircaPipeline::DCP_DiffR2(DCP_rhythm, method = "permutation", nSampling = 10000, Sampling.save = "perm0.1", parallel.ncores = 20)
+#save(x1, x2, DCP_rhythm, DCP_dparam, DCP_dparam2, DCP_dparam3, DCP_dR2,DCP_dR2_perm, file = paste0("DCP_output_0.1.rData"))
+```
+
+
+### outputs
+```{r, echo=FALSE}
+load("DCP_output_0.1.rData")
+
+a.TOJR = DCP_rhythm$rhythm.joint$TOJR
+tab.p = data.frame(cutoff = paste0("p-value < ", 0.05),
+                   RhyI = sum(a.TOJR=="rhyI"),
+                   RhyII = sum(a.TOJR=="rhyII"),
+                   RhyBoth = sum(a.TOJR=="both"),
+                   Arrhy = sum(a.TOJR=="arrhy"))
+a.TOJR = DCP_rhythm$rhythm.joint$TOJR.FDR
+tab.p = rbind.data.frame(tab.p, 
+                         data.frame(cutoff = paste0("q-value < ", 0.05),
+                   RhyI = sum(a.TOJR=="rhyI"),
+                   RhyII = sum(a.TOJR=="rhyII"),
+                   RhyBoth = sum(a.TOJR=="both"),
+                   Arrhy = sum(a.TOJR=="arrhy")))
+a.TOJR = DiffCircaPipeline::toTOJR(DCP_rhythm, method = "Sidak_FS", alpha = 0.1, adjustP = FALSE, parallel.ncores = 2)
+tab.p = rbind.data.frame(tab.p, 
+                         data.frame(cutoff = paste0("p-value < ", 0.1),
+                   RhyI = sum(a.TOJR=="rhyI"),
+                   RhyII = sum(a.TOJR=="rhyII"),
+                   RhyBoth = sum(a.TOJR=="both"),
+                   Arrhy = sum(a.TOJR=="arrhy")))
+a.TOJR = DiffCircaPipeline::toTOJR(DCP_rhythm, method = "Sidak_FS", alpha = 0.2, adjustP = TRUE, parallel.ncores = 2)
+tab.p = rbind.data.frame(tab.p, 
+                         data.frame(cutoff = paste0("q-value < ", 0.2),
+                   RhyI = sum(a.TOJR=="rhyI"),
+                   RhyII = sum(a.TOJR=="rhyII"),
+                   RhyBoth = sum(a.TOJR=="both"),
+                   Arrhy = sum(a.TOJR=="arrhy")))
+a.TOJR = DiffCircaPipeline::toTOJR(DCP_rhythm, method = "Sidak_FS", alpha = 0.3, adjustP = TRUE, parallel.ncores = 2)
+tab.p = rbind.data.frame(tab.p, 
+                         data.frame(cutoff = paste0("q-value < ", 0.3),
+                   RhyI = sum(a.TOJR=="rhyI"),
+                   RhyII = sum(a.TOJR=="rhyII"),
+                   RhyBoth = sum(a.TOJR=="both"),
+                   Arrhy = sum(a.TOJR=="arrhy")))
+tab.p2 = tab.p[c(1, 3, 4), ]
+colnames(tab.p2)[2] = "RhyI \n(Control)"
+colnames(tab.p2)[3] = "RhyII \n(SCZ)"
+
+pdf(paste0("Figures/TOJRtab.pdf"), width = 5)
+p<-gridExtra::tableGrob(tab.p2, rows = NULL)
+gridExtra::grid.arrange(p)
+dev.off()
+
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = DCP_dR2 %>% arrange(p.R2) %>%
+                                     filter(p.R2<0.05&delta.R2>0) %>% pull(gname),
+                                   Info1 = "Control", Info2 = "SCZ",
+                                   filename = paste0("Figures/scatter_dR2up.pdf"), file.height = 8, file.width = 16)
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = DCP_dR2 %>% arrange(p.R2) %>%
+                                     filter(p.R2<0.05&delta.R2<0) %>% pull(gname),
+                                   Info1 = "Control", Info2 = "SCZ",
+                                   filename = paste0("Figures/scatter_dR2down.pdf"), file.height = 8, file.width = 16)
+DiffCircaPipeline::DCP_PlotPeakDiff(DCP_rhythm, dPhase = DCP_dparam2)
+
+
+```
+
+
+
+### Summarize DR results 
+```{r, eval=FALSE}
+SC.res = mget(load("DCP_output.rData"))
+SummarizeDR = function(result = DCP_dR2$p.R2, test = "DRF", type = "p-value", val = 0.05, out = "long"){
+  if(class(result)!="list"){
+    result = list(result)
+  }
+  l = length(result)
+  stopifnot("Arguments `result`, `test`, `type`, `val` must have the same length" = (length(test)==l&length(type)==l&length(val)==l))
+  tab = lapply(1:l, function(a){
+    a.result = result[[a]]
+    a.test = test[a]
+    a.type = type[a]
+    a.val = val[a]
+    a.tab0 = table(a.result<a.val)
+    a.tab = data.frame(nTRUE = unname(ifelse(is.na(a.tab0["TRUE"]), 0, a.tab0["TRUE"])),
+                       nFALSE = unname(ifelse(is.na(a.tab0["FALSE"]), 0, a.tab0["FALSE"])),
+                       test = a.test,
+                       cutoff = paste0(a.type, "<", a.val))
+    return(a.tab)
+  })
+  tab = do.call(rbind.data.frame, tab)
+  tab$nTRUE = paste0(tab$nTRUE, "(/", tab$nTRUE+tab$nFALSE, ")")
+  if(out=="long"){
+    return(tab[, c(1, 3,4)])
+  }else if(out =="wide"){
+    tab.list = lapply(1:nrow(tab[, c(1, 3,4)]), function(i){
+      a.cell = data.frame(x = c(tab[i, "nTRUE"]))
+      rownames(a.cell) = NULL
+      colnames(a.cell) = paste0(tab[i, "test"], " ", tab[i, "cutoff"])
+      return(a.cell)
+    })
+    tab2 = do.call(cbind.data.frame, 
+                   tab.list)
+    return(tab2)
+  }
+}
+
+#SCZ
+DRtable = DiffCircaPipeline::SummarizeDR(result = list(SC.res$DCP_dR2$p.R2, SC.res$DCP_dR2$p.R2, SC.res$DCP_dR2$q.R2),
+            test = c(rep("DRF", 2), "DRF"),
+            type = c(rep("p-value", 2), "q-value"),
+            val = c(0.05, 0.1, 0.4), 
+            "long")
+pdf(paste0("Figures/DRFresultSummary.pdf"), width = 5)
+p<-gridExtra::tableGrob(DRtable, rows = NULL)
+gridExtra::grid.arrange(p)
+dev.off()
+```
+
+### IPA
+```{r}
+df = data.frame(ID = background.genes,
+                R2up = as.numeric(background.genes %in% (DCP_dR2 %>% filter(p.R2<0.05&delta.R2>0) %>% pull(gname))),
+                R2down = as.numeric(background.genes %in% (DCP_dR2 %>% filter(p.R2<0.05&delta.R2<0) %>% pull(gname)))
+                )
+write.csv(df, paste0("IPA_Input/TOJR0.1_dR2.csv"), row.names = FALSE)
+
+df = data.frame(ID = background.genes,
+                R2up = as.numeric(background.genes %in% (DCP_dR2_perm %>% filter(p.R2<0.05&delta.R2>0) %>% pull(gname))),
+                R2down = as.numeric(background.genes %in% (DCP_dR2_perm %>% filter(p.R2<0.05&delta.R2<0) %>% pull(gname)))
+                )
+write.csv(df, paste0("IPA_Input/TOJR0.1_dR2_perm.csv"), row.names = FALSE)
+
+df = data.frame(ID = background.genes,
+                R2up = as.numeric(background.genes %in% (DCP_dR2_perm %>% filter(p.R2<0.1&delta.R2>0) %>% pull(gname))),
+                R2down = as.numeric(background.genes %in% (DCP_dR2_perm %>% filter(p.R2<0.1&delta.R2<0) %>% pull(gname)))
+                )
+write.csv(df, paste0("IPA_Input/TOJR0.1_dR2_perm0.1.csv"), row.names = FALSE)
+
+df = data.frame(ID = background.genes,
+                Control = as.numeric(background.genes %in% (DCP_rhythm$rhythm.joint %>% filter(TOJR %in% c("rhyI", "both")) %>% pull(gname))),
+                SCZ = as.numeric(background.genes %in% (DCP_rhythm$rhythm.joint %>% filter(TOJR %in% c("rhyII", "both")) %>% pull(gname)))
+                )
+write.csv(df, paste0("IPA_Input/TOJR0.1_TOJR.csv"), row.names = FALSE)
+
+df = data.frame(ID = CMres$genes,
+                up = as.numeric(CMres$genes %in% (CMres2 %>% filter(R2gainPvalue<0.05) %>% pull(genes))),
+                down = as.numeric(CMres$genes %in% (CMres2 %>% filter(R2losePvalue<0.05) %>% pull(genes)))
+                )
+write.csv(df, paste0("IPA_Input/NatureComm_dR2.csv"), row.names = FALSE)
+
+
+```
+
+#### pathways
+```{r}
+#Mitochondrial dysfunction 
+mito.genes = "ATP5F1A,ATP5MC1,ATP5MC2,ATP5MG,ATPAF1,COX6A1,COX7A1,COX8A,HTRA2,NDUFB11,NDUFB2,NDUFS2,NDUFS3,NDUFS5,NDUFS8,NDUFV1,PARK7,PRDX5,PSEN2,UQCRC1,UQCRFS1"
+mito.genes = unlist(strsplit(mito.genes, ","))
+DCP_rhythm$rhythm.joint[match(mito.genes, DCP_rhythm$rhythm.joint$gname),]
+DCP_dR2_perm[match(mito.genes, DCP_dR2_perm$gname),]
+
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = mito.genes,
+                                  Info1 = "Control", Info2 = "SCZ", 
+                                  filename = "SCZvsControl/Pathway_MitochondroalDysfunction_DCPplot.pdf", file.width = 14)
+plot(DCP_dR2$R2.2-DCP_dR2$R2.1, -log10(DCP_dR2$p.R2), col = factor(DCP_dR2$p.R2<0.2))
+```
+
+#### Make enrichment plots
+```{r}
+IPA_R2down = readxl::read_xls("IPA_Output/TOJR_0.05_dR2_0.1/CanonicalPathways_R2down.xls", 
+                              skip = 1)
+IPA_R2up = readxl::read_xls("IPA_Output/TOJR_0.05_dR2_0.1/CanonicalPathways_R2up.xls", 
+                              skip = 1)
+
+# read.table("IPA_Output/TOJR0.05_dR2_0.1/CanonicalPathways_R2down.xls", fill = TRUE, skip = 2, header = TRUE, sep = "\t")[, 1:3]
+# IPA_SCZ = read.table("IPA_Output/TOJR0.1_TOJR/CanonicalPathways_SCZ.txt", fill = TRUE, skip = 2, header = TRUE, sep = "\t")[, 1:3]
+
+IPA_R2down$nOverlap = sapply(strsplit(IPA_R2down$Molecules, ","), length)
+IPA_R2up$nOverlap = sapply(strsplit(IPA_R2up$Molecules, ","), length)
+IPA_R2down2 = IPA_R2down %>% filter(`-log(p-value)`>-log10(0.05)&nOverlap>=3)
+IPA_R2up2 = IPA_R2up %>% filter(`-log(p-value)`>-log10(0.05)&nOverlap>=3)
+library(ggplot2)
+length(intersect(IPA_R2down2$`Ingenuity Canonical Pathways`, IPA_R2up2$`Ingenuity Canonical Pathways`))#no overlap
+# df = data.frame(Pathways = IPA_Control2$Ingenuity.Canonical.Pathways, UC = IPA_Control2$X.log.p.value.) %>% full_join(data.frame(Pathways = IPA_SCZ2$Ingenuity.Canonical.Pathways, SCZ = IPA_SCZ2$X.log.p.value.)) %>% 
+#   mutate(UC = ifelse(is.na(UC), 0, UC), 
+#          SCZ = ifelse(is.na(SCZ), 0, SCZ)) %>% 
+#   tidyr::pivot_longer(2:3, names_to = "Group", values_to = "-log10(p-value)") %>%
+#   mutate(Group = factor(Group))
+
+df = rbind.data.frame(IPA_R2down2 %>% mutate(Group = "decrease"), 
+                      IPA_R2up2 %>% mutate(Group = "increase")) %>% 
+  mutate(Group = factor(Group)) %>% 
+  arrange(`-log(p-value)`)%>%
+  arrange(Group)
+df$order = rownames(df)
+
+
+p = ggplot(df, aes(x = reorder(`Ingenuity Canonical Pathways`,order,
+                           function(x)as.numeric(x)), y = `-log(p-value)`, fill = Group))+
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_hline(yintercept=-log10(0.05), color = "#ede6e6")+
+  scale_fill_manual(values = c("#0da105", "#0512a1"), 
+                    breaks = c("decrease", "increase"), 
+                    labels = c(expression(Delta*R^2~"<"*0), 
+                               expression(Delta*R^2~">"*0)))+
+  xlab("")+
+  ylab(expression(-log[10]*"(p-value)"))+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.text.y = element_text(face="bold")) + 
+  coord_flip()
+pdf("Figures/dR2_IPA_plot.pdf", height = 5)
+print(p)
+dev.off()
+```
+
+## Weak signal discussion
+
+### IPA with qval<0.4
+```{r}
+load("DCP_output.rData")
+background.genes = x1$gname
+df = data.frame(ID = background.genes,
+                R2up = as.numeric(background.genes %in% (DCP_dR2 %>% filter(q.R2<0.4&delta.R2>0) %>% pull(gname))),
+                R2down = as.numeric(background.genes %in% (DCP_dR2 %>% filter(q.R2<0.4&delta.R2<0) %>% pull(gname)))
+                )
+write.csv(df, paste0("IPA_Input/TOJR_p0.5_dR2_q0.4.csv"), row.names = FALSE)
+
+```
+
+
+
+```{r}
+IPA_R2down = readxl::read_xls("IPA_Output/TOJR_p0.05_dR2_q0.4/CanonicalPathways_R2down.xls", 
+                              skip = 1)
+IPA_R2up = readxl::read_xls("IPA_Output/TOJR_p0.05_dR2_q0.4/CanonicalPathways_R2up.xls", 
+                              skip = 1)
+
+# read.table("IPA_Output/TOJR0.05_dR2_0.1/CanonicalPathways_R2down.xls", fill = TRUE, skip = 2, header = TRUE, sep = "\t")[, 1:3]
+# IPA_SCZ = read.table("IPA_Output/TOJR0.1_TOJR/CanonicalPathways_SCZ.txt", fill = TRUE, skip = 2, header = TRUE, sep = "\t")[, 1:3]
+
+IPA_R2down$nOverlap = sapply(strsplit(IPA_R2down$Molecules, ","), length)
+IPA_R2up$nOverlap = sapply(strsplit(IPA_R2up$Molecules, ","), length)
+IPA_R2down2 = IPA_R2down %>% filter(`-log(p-value)`>-log10(0.05)&nOverlap>=3)
+IPA_R2up2 = IPA_R2up %>% filter(`-log(p-value)`>-log10(0.05)&nOverlap>=3)
+
+IPA_R2down %>% mutate(noverlap = length(strsplit(Molecules, ",")))
+library(ggplot2)
+length(intersect(IPA_R2down2$`Ingenuity Canonical Pathways`, IPA_R2up2$`Ingenuity Canonical Pathways`))#no overlap
+# df = data.frame(Pathways = IPA_Control2$Ingenuity.Canonical.Pathways, UC = IPA_Control2$X.log.p.value.) %>% full_join(data.frame(Pathways = IPA_SCZ2$Ingenuity.Canonical.Pathways, SCZ = IPA_SCZ2$X.log.p.value.)) %>% 
+#   mutate(UC = ifelse(is.na(UC), 0, UC), 
+#          SCZ = ifelse(is.na(SCZ), 0, SCZ)) %>% 
+#   tidyr::pivot_longer(2:3, names_to = "Group", values_to = "-log10(p-value)") %>%
+#   mutate(Group = factor(Group))
+
+df = rbind.data.frame(IPA_R2down2 %>% mutate(Group = "decrease"), 
+                      IPA_R2up2 %>% mutate(Group = "increase")) %>% 
+  mutate(Group = factor(Group)) %>% 
+  arrange(`-log(p-value)`)%>%
+  arrange(Group)
+df$order = rownames(df)
+
+
+p = ggplot(df, aes(x = reorder(`Ingenuity Canonical Pathways`,order,
+                           function(x)as.numeric(x)), y = `-log(p-value)`, fill = Group))+
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_hline(yintercept=-log10(0.05), color = "#ede6e6")+
+  scale_fill_manual(values = c("#0da105", "#0512a1"), 
+                    breaks = c("decrease", "increase"), 
+                    labels = c(expression(Delta*R^2~"<"*0), 
+                               expression(Delta*R^2~">"*0)))+
+  xlab("")+
+  ylab(expression(-log[10]*"(p-value)"))+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.text.y = element_text(face="bold")) + 
+  coord_flip()
+pdf("Figures/TOJR_p0.5_dR2_q0.4_IPA_plot.pdf", height = 5)
+print(p)
+dev.off()
+
+# 
+# 
+# table(DCP_dR2$q.R2<0.4, DCP_dR2$delta.R2>0)
+# hist(DCP_dR2$p.R2, breaks = seq(0, 1, 0.05))
+
+```
+
+```{r}
+hist(DCP_dR2$p.R2, breaks = seq(0, 1, 0.05))
+p = ggplot(data.frame(x = DCP_dR2$p.R2), aes(x = x))+
+  geom_histogram(color = "white", breaks=seq(0, 1, 0.05))+
+  theme_bw()+
+  xlab("p-value")+
+  ggtitle("Histogram of p-values of the DRF test")
+pdf("Figures/TOJR_0.05_dR2_pval_histogram.pdf", height = 5)
+print(p)
+dev.off()
+```
+
+### Pathway genes
+```{r}
+#LPS/IL-1 Mediated Inhibition of RXR Function
+Pulmonary.genes = c("CXCL12","ETV5","HBEGF","TCF7")
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = Pulmonary.genes,
+                                   Info1 = "Control", Info2 = "SCZ",
+                                   filename = paste0("Figures/scatter_TOJR0.05_dR2q0.4_down_Pulmonary.pdf"), file.height = 4, file.width = 8)
+Cholesterol.genes = c("EBP","HSD17B7","MVD")
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = Cholesterol.genes,
+                                   Info1 = "Control", Info2 = "SCZ",
+                                   filename = paste0("Figures/scatter_TOJR0.05_dR2q0.4_up_Cholesterol.pdf"), file.height = 4, file.width = 8)
+
+```
+

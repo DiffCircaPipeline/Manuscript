@@ -1,0 +1,648 @@
+---
+title: "Methylation"
+author: "Xiangning Xue"
+date: "5/15/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(GEOquery)
+library(Biobase)
+library(dplyr)
+```
+
+## Prepare data
+```{r meta_data}
+GEO.ID = "GSE103249"
+gset <- getGEO(GEO.ID,  GSEMatrix =TRUE, getGPL=TRUE)
+data.pdata = pData(gset[[1]]) #the meta data
+# summary of the data: all male tissues from cerebral cortex (18 WT + 18 Snord116+/-)
+ZT.time = gsub(".*ZT([0-9]+)_rep[0-9]", "\\1", data.pdata$title) %>% as.numeric()
+group.label = gsub("(.*) ZT.*", "\\1", data.pdata$title)
+write.csv(data.pdata[, "supplementary_file_1", drop = FALSE], "RawDataFTP.csv") #delete header manually
+meta.df = data.frame(ZT = ZT.time, genotype = group.label)
+rownames(meta.df) = rownames(data.pdata)
+write.csv(meta.df, "metadata.csv")
+```
+
+```{r exprs_data exploration, eval=FALSE}
+######## The following does not work
+# #!/bin/sh
+# while IFS=, read -r sample ftp
+# do
+#     ftp --recursive --no-parent -nd -O ./raw/$sample.zip $ftp
+# done < RawDataFTP.csv
+
+######## The following works
+# wget 'ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE103nnn/GSE103249/suppl/GSE103249_RAW.tar'
+# cd raw
+# tar –xvzf raw/GSE103249_RAW.tar
+hdir = "/home/xix66/circadian/ThePipeline/CircadianPipeline_private/RealData/methylation"
+bed <- as.data.frame(read.table(paste0(hdir, "/raw/GSM2758987_JLRC002B.bed.gz"),header = FALSE, sep="\t",stringsAsFactors=FALSE, quote=""))
+colnames(bed) = c("chrom", "chromStart", "chromEnd", "V4", "V5", "strand", "V7", "V8", "V9")
+#some explorations
+dim(bed) #15223218        9
+table(bed$strand) #all "+", so just one strand
+quantile(bed$V5, na.rm =TRUE) # all 0
+quantile(bed$V7, na.rm =TRUE) # all 0
+quantile(bed$V8, na.rm =TRUE) # all 0
+# V5, V7, V8 are placeholders. 
+#V4; percent methylation and number of reads contributing to the permeth call
+bed$pm = gsub("(.*)-.*", "\\1",  bed$V4)
+bed$nReads = gsub(".*-(.*)", "\\1",  bed$V4)
+quantile(as.numeric(bed$pm), na.rm =TRUE) 
+#  0%  25%  50%  75% 100% 
+#0.00 0.67 1.00 1.00 1.00 
+quantile(as.numeric(bed$nReads), na.rm =TRUE) 
+#  0%  25%  50%  75% 100% 
+#   1    1    3    4  147
+bed2 <- as.data.frame(read.table(paste0(hdir, "/raw/GSM2758975_JLRC002A.bed.gz"),header = FALSE, sep="\t",stringsAsFactors=FALSE, quote=""))
+dim(bed)#15223218       10
+dim(bed2)#15573035        9
+bed2$pm = gsub("(.*)-.*", "\\1",  bed2$V4)
+bed2$nReads = gsub(".*-(.*)", "\\1",  bed2$V4)
+quantile(as.numeric(bed2$pm), na.rm =TRUE) 
+#  0%  25%  50%  75% 100% 
+#0.00 0.67 1.00 1.00 1.00 
+quantile(as.numeric(bed2$nReads), na.rm =TRUE) 
+#  0%  25%  50%  75% 100% 
+#   1    2    3    5  150
+sum(as.numeric(bed2$nReads)>10) 
+sum(as.numeric(bed$nReads)>10)
+head(bed2[bed2$nReads==1, ], n = 10)
+head(bed[bed$nReads==1, ], n = 10)
+head(bed2[bed2$nReads==2, ], n = 10)
+head(bed[bed$nReads==2, ], n = 10)
+```
+
+
+```{r exprs_data process the data, eval=FALSE}
+ToBeta = function(aBedSample){
+  V4 = aBedSample$V4
+  chromInfo = aBedSample[, 1:3]
+  pm = gsub("(.*)-.*", "\\1",  V4)
+  nReads = gsub(".*-(.*)", "\\1",  V4) 
+  return(list(pm = cbind.data.frame(chromInfo, pm = pm),
+              nReads = cbind.data.frame(chromInfo, nReads = nReads)))
+}
+
+samples = list.files(paste0(hdir, "/raw"))
+samples = samples[samples != "GSE103249_RAW.tar"]
+ALL.BED.INFO = parallel::mclapply(samples, function(a){
+  a.bed <- as.data.frame(read.table(paste0(hdir, "/raw/", a),header = FALSE, sep="\t",stringsAsFactors=FALSE, quote=""))
+  res = ToBeta(a.bed)
+  return(res)
+}, mc.cores = 18)
+names(ALL.BED.INFO) = gsub("(GSM[0-9]+)_.*", "\\1", samples)
+saveRDS(ALL.BED.INFO, paste0(hdir, "/raw/AllBedInfo.rds"))
+# ALL.pm = Reduce(function(x, y) merge(x, y, by=c("V1", "V2", "V3")), lapply(ALL.BED.INFO, `[[`, 1))
+# ALL.nReads = Reduce(function(x, y) merge(x, y, by=c("V1", "V2", "V3")), lapply(ALL.BED.INFO, `[[`, 2))
+# dim(All.pm)
+
+
+```
+
+```{r buid_bsseq_obj_with_github_code}
+library(bsseq) 
+#original code see: https://github.com/hansenlab/bsseq/blob/master/inst/scripts/get_BS.chr22.R
+read.mydat <- function(a.file, SampleName) {
+  #my date only has one strand
+    BS <- BSseq(
+        pos = a.file[[1]]$V2,
+        chr = a.file[[1]]$V1,
+        M = as.matrix(as.integer(as.numeric(as.character(a.file[[1]]$pm))*as.numeric(as.character(a.file[[2]]$nReads))), ncol = 1),
+        Cov = as.matrix(as.integer(as.numeric(as.character(a.file[[2]]$nReads))), ncol = 1),
+        sampleNames = SampleName)
+    BS
+}
+BS.list = lapply(1:length(ALL.BED.INFO), function(a){
+  a.BS <- read.mydat(ALL.BED.INFO[[a]], names(ALL.BED.INFO)[a])
+  sampleNames(a.BS) <- names(ALL.BED.INFO)[a]
+  return(a.BS)
+  })
+
+BS.obj <- combineList(BS.list)
+BS.obj <- orderBSseq(BS.obj, seqOrder = c(paste0("chr", seq(1:19)), "chrM", "chrX", "chrY"))
+head(getCoverage(BS.obj, type = "M"), n = 4)[, 1:3]
+head(getCoverage(BS.obj, type = "Cov"), n = 4)[, 1:3]
+BS.temp = BS.list[[1]]
+BS.temp <- orderBSseq(BS.temp, seqOrder = c(paste0("chr", seq(1:19)), "chrM", "chrX", "chrY"))
+head(getCoverage(BS.temp, type = "Cov"), n = 4)
+granges(BS.obj)[1:4, ]
+granges(BS.temp)[1:4, ]
+ALL.BED.INFO[[1]][[1]][ALL.BED.INFO[[1]][[1]]$V1=="chr1"&ALL.BED.INFO[[1]][[1]]$V2==3000827, ]
+ALL.BED.INFO[[1]][[2]][ALL.BED.INFO[[1]][[1]]$V1=="chr1"&ALL.BED.INFO[[1]][[1]]$V2==3000827, ]
+
+meta = read.csv(paste0(hdir, "/metadata.csv"), row.names = 1)
+all(names(ALL.BED.INFO)%in%rownames(meta)) #TRUE
+all(rownames(meta)%in%names(ALL.BED.INFO)) #TRUE
+meta = meta[names(ALL.BED.INFO), ]
+pData(BS.obj)$ZT <- meta$ZT
+pData(BS.obj)$genotype <- meta$genotype
+validObject(BS.obj)
+pData(BS.obj)
+saveRDS(BS.obj, paste0(hdir, "/BSobj.rds"))
+# rm(bed, bed2, ALL.BED.INFO, BS.list)
+```
+
+From the raw data, we get a methylation percentage table of dimension (), and a read number table of the same dimension. We first filter the CpG loci to contain only those that have reads in all samples, which leaves us () loci. 
+
+Two statistics used ($N_{i, \text{methy}}$ is the number of methylated reads in sample $i$, and $N_{i, \text{unmethy}}$ is the number of unmethylated reads in sample $i$): 
+  
+  * Beta value: $B_i = \frac{N_{i, \text{methy}}}{N_{i, \text{unmethy}}+\alpha}$,
+  * M value: $M_i = \log_2{\frac{N_{i, \text{methy}}+\alpha}{N_{i, \text{unmethy}}+\alpha}}$. 
+Here $\alpha$ is a offset constant. 
+  
+Some loci has low reads in some samples, thus the methylation percentage evaluated might not be accurate. Specially, loci with #reads = 1 will have beta value = 0 or 1 for all samples. 
+
+### Reload the data
+```{r}
+hdir = "/home/xix66/circadian/ThePipeline/CircadianPipeline_private/RealData/methylation"
+BS.obj = readRDS(paste0(hdir, "/BSobj.rds"))
+```
+
+
+## Circadian analysis
+
+### Fit by CpG site.
+```{r, eval = FALSE}
+# if we fit model locus by locus, problem is that the curve is not smooth enough. Also it will be harder to explain. 
+# Also, the result shows weak signal, better do something to strengthen the signal. 
+
+#filter out loci with too many zero reads
+filterByNReads = function(groups, nReads){
+  nReads.list = sep(t(nReads), groups)
+  reads.sum
+}
+keep = apply(getCoverage(BS.obj, type = "Cov"), 1, function(x){mean(x>0)}) #the kept loci must have at least one read in each sample
+#6970239 out of 20235445
+keep2 = apply(getCoverage(BS.obj, type = "Cov"), 1, function(x){mean(x>1)}) #the kept loci must have at least two read in each sample
+#2791512
+keep5 = apply(getCoverage(BS.obj, type = "Cov"), 1, function(x){mean(x>=5)}) #the kept loci must have at least two read in each sample
+#97133
+#Try fit with threshold 2, but actually should use 5. 
+BS.obj.sub = BS.obj[keep2 == 1, ]
+meth.sub = getMeth(BS.obj.sub, type = "raw")
+M.sub = log2((meth.sub+1e-5)/(1-meth.sub+1e-5))
+
+x1 = list(data = data.frame(M.sub[, pData(BS.obj.sub)$genotype == "WT"]), 
+          time = pData(BS.obj.sub)[pData(BS.obj.sub)$genotype == "WT", "ZT"], 
+          gname = seq_len(nrow(M.sub)))
+x2 = list(data = data.frame(M.sub[, pData(BS.obj.sub)$genotype != "WT"]), 
+          time = pData(BS.obj.sub)[pData(BS.obj.sub)$genotype != "WT", "ZT"], 
+          gname = seq_len(nrow(M.sub)))
+DCP_rhythm = DiffCircaPipeline::DCP_Rhythmicity(x1, x2, parallel.ncores = 20)
+time1 = Sys.time()
+DCP_dparam = DiffCircaPipeline::DCP_DiffPar(DCP_rhythm, Par = "A&phase")
+time2 = Sys.time()
+DCP_dR2 = DiffCircaPipeline::DCP_DiffR2(DCP_rhythm)
+time3 = Sys.time()
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = DCP_rhythm$rhythm.joint %>% 
+                                     filter(TOJR=="both")%>%
+                                     mutate(meanP = 1/2*sum(c(1-log(pG1), 1-log(pG2)))) %>%
+                                     arrange(meanP) %>%
+                                     pull(gname) %>% head(20), 
+                                   Info1 = "WT", Info2 = "Snord116",
+                                   filename = "Scatter_both", file.height = 8, file.width = 16)
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, 
+                                   Info1 = "WT", Info2 = "Snord116",
+                                   filename = "Scatter_both_1", file.height = 8, file.width = 16)
+time4 = Sys.time()
+DiffCircaPipeline::DCP_PlotPeakDiff(DCP_rhythm, NULL, DCP_dparam,
+                                    color.cut = list(param = "post.hoc.peak.By.p", fun = ">", val = 0, color.sig = "#b33515", color.none = "dark grey"),
+                                    Info1 = "WT", Info2 = "Snord116",
+                                    filename = "PhaseDiff", file.height = 8, file.width = 8, time.start = 0)
+time5 = Sys.time()
+DiffCircaPipeline::DCP_PlotPeakRadar(DCP_rhythm, NULL, TRUE,
+                                     Info1 = "WT", Info2 = "Snord116",
+                                     filename = "PhaseRadar", file.height = 8, file.width = 8, time.start = 0)
+time6 = Sys.time()
+```
+
+
+```{r methylsig, eval = FALSE}
+# test smooth by window. But currently I want to smooth by gene because it is easier to explain. 
+# BiocManager::install("methylSig")
+# BiocManager::install("DSS")
+# install.packages("/home/xix66/circadian/ThePipeline/CircadianPipeline_private/methylSig_1.8.0.tar", repos = NULL)
+
+#filter out low reads. (will not filter by SNP because I do not know the genotype)
+BS.obj.msfilter = methylSig::filter_loci_by_coverage(BS.obj, min_count = 5, max_count = 500)
+#check dimension: both still have 20235445 methylation loci, maybe just the low ones are set to 0 but not deleted. 
+
+#test tiling by window (use a large window)
+windowed_bs = methylSig::tile_by_windows(bs = BS.obj.msfilter, win_size = 100000)
+windowed_meth = getMeth(windowed_bs, type = "raw")
+#how many does not contain NA?
+windowed_meth.na = parallel::mclapply(1:nrow(windowed_meth), function(a){
+  a.row = as.numeric(windowed_meth[a, ])
+  mean(is.na(a.row))
+  }, mc.cores = 20)
+sum(windowed_meth.na==0)#25324 still plenty 
+
+
+```
+
+### Fit by gene
+```{r gene_windows}
+#Mus musculus
+# BiocManager::install("methylKit")
+# BiocManager::install("genomation")
+# I downloaded a map here: http://genome.ucsc.edu/cgi-bin/hgTables
+gene.obj0 = read.csv("/home/xix66/circadian/ThePipeline/CircadianPipeline_private/RealData/methylation/Galaxy3-[UCSC_Main_on_Mouse__wgEncodeGencodeCompVM11_(genome)].csv")
+gene.obj0 = gene.obj0[, c(2:6, 13)]#should keep txStart and txEnd
+gene.obj0 = gene.obj0[gene.obj0$strand=="+", ]
+gene.obj0 = gene.obj0[gene.obj0$chrom %in% c(paste0("chr", seq(1:19)), "chrM", "chrX", "chrY"), ]
+gene.obj0 = gene.obj0[, -3]
+#keep unique genes and keep the one with largest range
+time1 = Sys.time()
+gene.obj0.by.gene = split(gene.obj0, list(as.character(gene.obj0$name2))) %>% #19473 genes
+  lapply(function(a.gene.tab){
+    if(nrow(a.gene.tab)<=1){
+      keep = a.gene.tab
+    }else{
+      width = a.gene.tab$txEnd-a.gene.tab$txStart
+      keep = a.gene.tab[which.max(width),]
+    }
+    return(keep)
+  })
+time2 = Sys.time()
+gene.obj0.unique.gene = do.call(rbind.data.frame, gene.obj0.by.gene)
+dim(gene.obj0.unique.gene) #19473
+range = gene.obj0.unique.gene$txEnd-gene.obj0.unique.gene$txStart
+quantile(range)
+     # 0%     25%     50%     75%    100% 
+     # 11    1067    6226   25717 4434882 
+
+gene.obj=GenomicRanges::makeGRangesFromDataFrame(gene.obj0.unique.gene, keep.extra.columns = TRUE, ignore.strand=TRUE,
+                                                 seqnames.field = "chrom", start.field = "txStart", end.field = "txEnd", 
+                                                 strand.field = "strand")#19473 ranges
+
+BS.obj.msfilter = methylSig::filter_loci_by_coverage(BS.obj, min_count = 5, max_count = 500)
+# #check what happens after filtering by coverage. -> Basically a clear cut off, if less than 5 then set as 0. 
+# BS.obj.Cov = bsseq::getCoverage(BS.obj, type = "Cov")
+# BS.obj.msfilter.Cov = bsseq::getCoverage(BS.obj.msfilter, type = "Cov")
+# quantile(BS.obj.Cov)
+#   # 0%  25%  50%  75% 100% 
+#   #  0    1    3    5  177
+# quantile(BS.obj.msfilter.Cov)
+#  #  0%  25%  50%  75% 100%  
+#  #   0    0    0    5  177 
+# mean(BS.obj.Cov!=0) #0.3072646
+# mean(BS.obj.msfilter.Cov!=0) #0.8590005
+region_bs = methylSig::tile_by_regions(bs = BS.obj.msfilter, gr = gene.obj)#19473 
+meth.region = bsseq::getMeth(region_bs, type = "raw")
+M.region = log2((meth.region+1e-5)/(1-meth.region+1e-5))
+p.na = lapply(1:nrow(M.region), function(a){
+  a.row = as.numeric(M.region[a, ])
+  mean(is.na(a.row))
+  })
+p.na = unlist(p.na)
+sum(p.na==0) #19234
+sum(p.na==0) #19234
+M.region.keep = M.region[p.na==0, ] #12815
+meth.region.keep= bsseq::getCoverage(region_bs, type = "M")[p.na==0, ]
+cov.region.keep= bsseq::getCoverage(region_bs, type = "Cov")[p.na==0, ]
+gname.keep = as.data.frame(GenomicRanges::granges(region_bs))[p.na==0, ]
+
+x1 = list(data = data.frame(M.region.keep[, bsseq::pData(region_bs)$genotype == "WT"]), 
+          time = bsseq::pData(region_bs)[bsseq::pData(region_bs)$genotype == "WT", "ZT"], 
+          gname = gname.keep$name2)
+x2 = list(data = data.frame(M.region.keep[, bsseq::pData(region_bs)$genotype != "WT"]), 
+          time = bsseq::pData(region_bs)[bsseq::pData(region_bs)$genotype != "WT", "ZT"], 
+          gname = gname.keep$name2)
+DCP_rhythm = DiffCircaPipeline::DCP_Rhythmicity(x1, x2)
+table(DCP_rhythm$rhythm.joint$TOJR)
+table(DCP_rhythm$rhythm.joint$TOJR.FDR)
+DCP_dparam = DiffCircaPipeline::DCP_DiffPar(DCP_rhythm, Par = "A&phase")
+DCP_dparam2 = DiffCircaPipeline::DCP_DiffPar(DCP_rhythm, Par = "phase")
+DCP_dR2 = DiffCircaPipeline::DCP_DiffR2(DCP_rhythm)
+save(x1, x2, DCP_rhythm, DCP_dparam, DCP_dparam2, DCP_dR2, file = paste0(hdir, "/DCP_output.rData"))
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = DCP_rhythm$rhythm.joint %>% 
+                                     filter(TOJR=="both")%>%
+                                     mutate(tG1 = 1-log(pG1), tG2 = 1-log(pG2)) %>%
+                                     mutate(meanP = mean(c(tG1, tG2))) %>%
+                                     arrange(meanP) %>%
+                                     pull(gname) %>% head(20), 
+                                   Info1 = "WT", Info2 = "Snord116",
+                                   filename = paste0(hdir, "/ByGene_Scatter_both"), file.height = 8, file.width = 16)
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, 
+                                   Info1 = "WT", Info2 = "Snord116",
+                                   filename = paste0(hdir, "/ByGene_Scatter_1.pdf"), file.height = 8, file.width = 16)
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = DCP_dparam %>%
+                                     filter(post.hoc.peak.By.p) %>% 
+                                     pull(gname),
+                                   Info1 = "WT", Info2 = "Snord116",
+                                   filename = paste0(hdir, "/ByGene_Scatter_dPhase"), file.height = 8, file.width = 16)
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = DCP_dR2 %>%
+                                     arrange(p.R2) %>% 
+                                     pull(gname) %>% 
+                                     `[`(1:20),
+                                   Info1 = "WT", Info2 = "Snord116",
+                                   filename = paste0(hdir, "/ByGene_Scatter_dR2"), file.height = 8, file.width = 16)
+
+DiffCircaPipeline::DCP_PlotPeakDiff(DCP_rhythm, NULL, NULL,
+                                    color.cut = list(param = "post.hoc.peak.By.p", fun = "<", val = 1, color.sig = "#b33515",
+                                                     color.none = "dark grey"),
+                                    Info1 = "WT", Info2 = "Snord116",
+                                    filename = paste0(hdir, "/ByGene_PhaseDiff.pdf"), file.height = 8, file.width = 8, time.start = 0)
+DiffCircaPipeline::DCP_PlotPeakRadar(DCP_rhythm, NULL, TRUE,
+                                     Info1 = "WT", Info2 = "Snord116",
+                                     filename = paste0(hdir, "/ByGene_PhaseRadar.pdf"), file.height = 8, file.width = 8, time.start = 0)
+
+load("DCP_output.rData")
+load(paste0(hdir, "/DCP_output.rData"))
+```
+
+#### Validating the result with permutation test
+
+Since the result shows very weak signal, it is possible that the model does not fit the data. We validate the performance with permutation and the p-values from the two methods are very concordant. 
+```{r}
+library('minpack.lm')
+source(paste0(hdir, '/code/fitSinCurve.R'))
+
+dir.create(paste0(hdir, "/FitByGene_PermRes"), recursive = TRUE)
+B<-1000
+set.seed(12345)
+result = parallel::mclapply(1:B, function(b){
+  print(b)
+  x1.perm = x1; x1.perm$time = sample(x1.perm$time)
+  x2.perm = x2; x2.perm$time = sample(x2.perm$time)
+  DCP_rhythm.x1.perm = DiffCircaPipeline::DCP_Rhythmicity(x1.perm)
+  DCP_rhythm.x2.perm = DiffCircaPipeline::DCP_Rhythmicity(x2.perm)
+  a.res = list(x1.perm.res = DCP_rhythm.x1.perm$rhythm, 
+              x2.perm.res = DCP_rhythm.x2.perm$rhythm)
+  saveRDS(a.res, paste0(hdir, "/FitByGene_PermRes", "/", "perm", b, ".rds"))
+  return(a.res)
+}, mc.cores = 20)
+
+result = parallel::mclapply(1:B, function(b){
+  readRDS(paste0(hdir, "/FitByGene_PermRes", "/", "perm", b, ".rds"))
+}, mc.cores = 20)
+
+n <- nrow(x1$data)
+x1_null_R2 <- matrix(0,n,B)
+x2_null_R2 <- matrix(0,n,B)
+
+for(b in 1:B){
+  print(b)
+  x1_null_R2[, b] <- result[[b]][[1]]$R2
+  x2_null_R2[, b] <- result[[b]][[2]]$R2
+}
+
+x1_R2_pool <- c(DCP_rhythm$x1$rhythm$R2, x1_null_R2)
+x1_R2Rank <- 1 - (rank(x1_R2_pool)[1:length(DCP_rhythm$x1$rhythm$R2)] - 0.5)/length(x1_R2_pool)
+x2_R2_pool <- c(DCP_rhythm$x2$rhythm$R2, x2_null_R2)
+x2_R2Rank <- 1 - (rank(x2_R2_pool)[1:length(DCP_rhythm$x2$rhythm$R2)] - 0.5)/length(x2_R2_pool)
+
+pdf(paste0(hdir, "/FitByGene_CompareWithPermRes.pdf"))
+par(mfrow=c(1, 2))
+plot(-log10(DCP_rhythm$x1$rhythm$pvalue), -log10(x1_R2Rank), xlab = "DCP pvalues", ylab = "permutation pvalues", main = "WT")
+abline(a = 0, b = 1, col = "red", lty = 2)
+plot(-log10(DCP_rhythm$x2$rhythm$pvalue), -log10(x2_R2Rank), xlab = "DCP pvalues", ylab = "permutation pvalues", main = "Snord116")
+abline(a = 0, b = 1, col = "red", lty = 2)
+dev.off()
+```
+
+#### Enrichment analysis
+```{r}
+#speed 4
+hdir = "/home/xix66/circadian/ThePipeline/CircadianPipeline_private/RealData/methylation"
+hdir = "/Users/xiangningxue/Library/CloudStorage/OneDrive-UniversityofPittsburgh/Research/circadian/ThePipeline/R_package_github/DiffCircaPipeline/MethylationData"
+background.genes = x1$gname
+length.max = length(background.genes)
+fill.vec = function(a.vec, length.max=nrow(res)){
+  c(a.vec, rep("", length.max-length(a.vec)))
+}
+df = data.frame(RhyI = fill.vec(as.character(DCP_rhythm$rhythm.joint$gname)[DCP_rhythm$rhythm.joint$TOJR %in% c("rhyI")], length.max),
+                RhyII = fill.vec(as.character(DCP_rhythm$rhythm.joint$gname)[DCP_rhythm$rhythm.joint$TOJR %in% c("rhyII")], length.max),
+                RhyBoth = fill.vec(as.character(DCP_rhythm$rhythm.joint$gname)[DCP_rhythm$rhythm.joint$TOJR=="both"], length.max),
+                Background = background.genes)
+colnames(df) = c("WT only", "Snord116 only", "overlaps", "_BACKGROUND")
+dir.create(paste0(hdir, "/MetaScape_Input"))
+write.csv(df, paste0(hdir, "/MetaScape_Input/DCP_byGene_TOJR_", "WT", "_", "Snord116", ".csv"), row.names = FALSE)
+
+df2 = data.frame(WT = fill.vec(as.character(DCP_rhythm$rhythm.joint$gname)[DCP_rhythm$rhythm.joint$TOJR %in% c("rhyI", "both")], length.max),
+                Snord116 = fill.vec(as.character(DCP_rhythm$rhythm.joint$gname)[DCP_rhythm$rhythm.joint$TOJR %in% c("rhyII", "both")], length.max),
+                Background = background.genes)
+colnames(df2) = c("WT", "Snord116", "_BACKGROUND")
+write.csv(df2, paste0(hdir, "/MetaScape_Input/DCP_byGene_TOJR2_", "WT", "_", "Snord116", ".csv"), row.names = FALSE)
+
+#differential phase genes 
+df3 = data.frame(R2up = fill.vec(as.character(DCP_dR2$gname)[DCP_dR2$p.R2<0.05&DCP_dR2$delta.R2>0], length.max),
+                 R2down = fill.vec(as.character(DCP_dR2$gname)[DCP_dR2$p.R2<0.05&DCP_dR2$delta.R2<0], length.max),
+                 Background = background.genes)
+colnames(df3) = c("R2up", "R2down", "_BACKGROUND")
+write.csv(df3, paste0(hdir, "/MetaScape_Input/DCP_byGene_dR2_", "WT", "_", "Snord116", ".csv"), row.names = FALSE)
+
+#check if dR2 genes is a subset of rhyI/II
+RhyI.II = as.character(DCP_rhythm$rhythm.joint$gname)[DCP_rhythm$rhythm.joint$TOJR %in% c("rhyI", "rhyII")]
+g.dR2 = as.character(DCP_dR2$gname)[DCP_dR2$p.R2<0.05]
+all(g.dR2%in%RhyI.II)
+```
+
+```{bash runMetaScape}
+##start docker
+sudo systemctl start docker
+##test run docker
+sudo docker run hello-world
+
+cd /home
+cd xix66/msbio_v3
+#I don't know why but I cannot run without sudo
+#1. open the MSBio containers
+sudo bin/up.sh 
+#2. run analysis
+sudo bin/ms.sh -o /data/CircadianPipeline/Methylation/MetaScape_Output/ByGeneTOJR2_rerun_mouse -S 10090 -T 10090 /data/CircadianPipeline/Methylation/MetaScape_Input/DCP_byGene_TOJR2_WT_Snord116.csv --option /data/CircadianPipeline/Methylation/MetaScape_Input/option.json
+# I suppose 10090 is code for mouse? https://metascape.org/gp/index.html#/menu/msbio. 
+
+#shut down the container
+sudo bin/down.sh
+```
+
+#### Pathway genes
+```{r}
+load("DCP_output.rData")
+MAPK.genes = readxl::read_xlsx("MetaScape_Output/ByGeneTOJR2_MAPKgenes.xlsx") %>% as.data.frame()
+colnames(MAPK.genes)[1] = "genes"
+DCP_rhythm$gname_overlap = toupper(DCP_rhythm$gname_overlap)
+DCP_rhythm$x1$gname = toupper(DCP_rhythm$x1$gname)
+DCP_rhythm$x2$gname = toupper(DCP_rhythm$x2$gname)
+DCP_rhythm$x1$rhythm$gname = toupper(DCP_rhythm$x1$rhythm$gname)
+DCP_rhythm$x2$rhythm$gname = toupper(DCP_rhythm$x2$rhythm$gname)
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = MAPK.genes %>% 
+                                     filter(WT==1&Snord116!=1&genes%in%DCP_rhythm$gname_overlap) %>%pull(genes), 
+                                   Info1 = "WT", Info2 = "Snord116",
+                                   filename = "Figure/MAPKupGenes", file.height = 8, file.width = 16)
+
+DiffCircaPipeline::DCP_PlotDisplay(DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = "Ereg", Info1 = "WT", Info2 = "Snord116"))
+DiffCircaPipeline::DCP_PlotDisplay(DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = "Wdr77", Info1 = "WT", Info2 = "Snord116"))
+
+
+```
+
+#### Other outputs
+```{r}
+a.TOJR = DCP_rhythm$rhythm.joint$TOJR
+tab.p = data.frame(cutoff = paste0("p-value < ", 0.05),
+                   RhyI = sum(a.TOJR=="rhyI"),
+                   RhyII = sum(a.TOJR=="rhyII"),
+                   RhyBoth = sum(a.TOJR=="both"),
+                   Arrhy = sum(a.TOJR=="arrhy"))
+a.TOJR = DCP_rhythm$rhythm.joint$TOJR.FDR
+tab.p = rbind.data.frame(tab.p, 
+                         data.frame(cutoff = paste0("q-value < ", 0.05),
+                   RhyI = sum(a.TOJR=="rhyI"),
+                   RhyII = sum(a.TOJR=="rhyII"),
+                   RhyBoth = sum(a.TOJR=="both"),
+                   Arrhy = sum(a.TOJR=="arrhy")))
+a.TOJR = DiffCircaPipeline::toTOJR(DCP_rhythm, method = "Sidak_FS", alpha = 0.1, adjustP = FALSE, parallel.ncores = 2)
+tab.p = rbind.data.frame(tab.p, 
+                         data.frame(cutoff = paste0("p-value < ", 0.1),
+                   RhyI = sum(a.TOJR=="rhyI"),
+                   RhyII = sum(a.TOJR=="rhyII"),
+                   RhyBoth = sum(a.TOJR=="both"),
+                   Arrhy = sum(a.TOJR=="arrhy")))
+a.TOJR = DiffCircaPipeline::toTOJR(DCP_rhythm, method = "Sidak_FS", alpha = 0.2, adjustP = TRUE, parallel.ncores = 2)
+tab.p = rbind.data.frame(tab.p, 
+                         data.frame(cutoff = paste0("q-value < ", 0.2),
+                   RhyI = sum(a.TOJR=="rhyI"),
+                   RhyII = sum(a.TOJR=="rhyII"),
+                   RhyBoth = sum(a.TOJR=="both"),
+                   Arrhy = sum(a.TOJR=="arrhy")))
+a.TOJR = DiffCircaPipeline::toTOJR(DCP_rhythm, method = "Sidak_FS", alpha = 0.3, adjustP = TRUE, parallel.ncores = 2)
+tab.p = rbind.data.frame(tab.p, 
+                         data.frame(cutoff = paste0("q-value < ", 0.3),
+                   RhyI = sum(a.TOJR=="rhyI"),
+                   RhyII = sum(a.TOJR=="rhyII"),
+                   RhyBoth = sum(a.TOJR=="both"),
+                   Arrhy = sum(a.TOJR=="arrhy")))
+tab.p2 = tab.p[c(1, 3, 4), ]
+colnames(tab.p2)[2] = "RhyI \n(WT)"
+colnames(tab.p2)[3] = "RhyII \n(Snord116+/-)"
+pdf(paste0(hdir, "/ByGene_TOJRtab.pdf"), width = 5)
+p<-gridExtra::tableGrob(tab.p2, rows = NULL)
+gridExtra::grid.arrange(p)
+dev.off()
+
+
+```
+
+<!-- #### PSEA -->
+<!-- The PSEA app is here: /Users/xiangningxue/Library/CloudStorage/OneDrive-UniversityofPittsburgh/Research/CommonMind/Control_Rhythmicity_Compare_Gender_rm2/PSEA  -->
+
+<!-- I downloaded the mouse gene set here: http://ge-lab.org/#/data -->
+<!-- ```{r} -->
+<!-- PSEA.dir = paste0(hdir, "/PSEA/input") -->
+<!-- dir.create(PSEA.dir, recursive = TRUE) -->
+<!-- peak1 = DCP_rhythm$x1$rhythm %>%  -->
+<!--   filter(gname %in% (DCP_rhythm$rhythm.joint %>% filter(TOJR%in%c("rhyI", "both")) %>% pull("gname") %>% as.character)) %>% -->
+<!--   select(c("gname", "peak")) -->
+<!-- peak2 = DCP_rhythm$x2$rhythm %>%  -->
+<!--   filter(gname %in% (DCP_rhythm$rhythm.joint %>% filter(TOJR%in%c("rhyII", "both")) %>% pull("gname") %>% as.character)) %>% -->
+<!--   select(c("gname", "peak")) -->
+<!-- peak1$gname = toupper(peak1$gname) -->
+<!-- peak2$gname = toupper(peak2$gname) -->
+<!-- write.table(peak1, file = paste0(PSEA.dir, "/", "ByGene_WT", "_RhythGenes_Peak.txt"), row.names=FALSE, sep="\t", quote = FALSE, col.names = FALSE) -->
+<!-- write.table(peak2, file = paste0(PSEA.dir, "/", "ByGene_Snord116", "_RhythGenes_Peak.txt"), row.names=FALSE, sep="\t", quote = FALSE, col.names = FALSE) -->
+
+<!-- ``` -->
+
+```{r, eval=FALSE}
+m.res = mget(load("DCP_output.rData"))
+```
+
+#### Pathway genes corrected
+```{r}
+load("DCP_output.rData")
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = "Wdr77", 
+                                   Info1 = "WT", Info2 = "Snord116",
+                                   filename = "Figure/Wdr77.pdf", file.height = 4, file.width = 8)
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = "Ube2q1", 
+                                   Info1 = "WT", Info2 = "Snord116",
+                                   filename = "Figure/Ube2q1.pdf", file.height = 4, file.width = 8)
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = "Cited2", 
+                                   Info1 = "WT", Info2 = "Snord116",
+                                   filename = "Figure/Cited2.pdf", file.height = 4, file.width = 8)
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = "Pdia3", 
+                                   Info1 = "WT", Info2 = "Snord116",
+                                   filename = "Figure/Pdia3.pdf", file.height = 4, file.width = 8)
+DiffCircaPipeline::DCP_ScatterPlot(DCP_rhythm, genes.plot = "Utp14b", 
+                                   Info1 = "WT", Info2 = "Snord116",
+                                   filename = "Figure/Utp14b.pdf", file.height = 3, file.width = 6)
+
+```
+
+### Weak signal discussion
+```{r}
+load("DCP_output.rData")
+background.genes = x1$gname
+length.max = length(background.genes)
+fill.vec = function(a.vec, length.max=nrow(res)){
+  c(a.vec, rep("", length.max-length(a.vec)))
+}
+df = data.frame(R2up = fill.vec(as.character(DCP_dR2$gname)[DCP_dR2$q.R2<0.4&DCP_dR2$delta.R2>0], length.max),
+                R2down = fill.vec(as.character(DCP_dR2$gname)[DCP_dR2$q.R2<0.4&DCP_dR2$delta.R2<0], length.max),
+                 Background = background.genes)
+colnames(df) = c("R2up", "R2down", "_BACKGROUND")
+write.csv(df, paste0("MetaScape_Input/DCP_byGene_TOJR0.5_dR2_q0.4", ".csv"), row.names = FALSE)
+```
+
+
+```{bash runMetaScape}
+##start docker
+sudo systemctl start docker
+##test run docker
+sudo docker run hello-world
+
+cd /home
+cd xix66/msbio_v3
+#I don't know why but I cannot run without sudo
+#1. open the MSBio containers
+sudo bin/up.sh 
+#2. run analysis
+# for one analyses
+<!-- sudo bin/ms.sh -o /data/CircadianPipeline/Methylation/MetaScape_Output/ByGeneTOJR /data/CircadianPipeline/Methylation/MetaScape_Input/DCP_byGene_TOJR_WT_Snord116.csv --option /data/CircadianPipeline/Methylation/MetaScape_Input/option.json -->
+sudo bin/ms.sh -o /data/CircadianPipeline/Methylation/MetaScape_Output/ByGeneTOJR2 /data/CircadianPipeline/Methylation/MetaScape_Input/DCP_byGene_TOJR2_WT_Snord116.csv --option /data/CircadianPipeline/Methylation/MetaScape_Input/option.json
+sudo bin/ms.sh -o data/CircadianPipeline/Methylation/MetaScape_Output/ByGenedR2 data/CircadianPipeline/Methylation/MetaScape_Input/DCP_byGene_dR2_WT_Snord116_2.csv --option /data/CircadianPipeline/Methylation/MetaScape_Input/option.json
+#re-run (previous version has a as.character problem)
+sudo bin/ms.sh -o /data/CircadianPipeline/Methylation/MetaScape_Output/ByGeneTOJR2_rerun /data/CircadianPipeline/Methylation/MetaScape_Input/DCP_byGene_TOJR2_WT_Snord116.csv --option /data/CircadianPipeline/Methylation/MetaScape_Input/option.json
+#re-run 2 (previous forgot to specify this should be mouse )
+sudo bin/ms.sh -o /data/CircadianPipeline/Methylation/MetaScape_Output/ByGeneTOJR2_rerun_mouse -S 10090 -T 10090 /data/CircadianPipeline/Methylation/MetaScape_Input/DCP_byGene_TOJR2_WT_Snord116.csv --option /data/CircadianPipeline/Methylation/MetaScape_Input/option.json
+# I suppose 10090 is code for mouse? https://metascape.org/gp/index.html#/menu/msbio. 
+
+# for multiple analyses #but only the first one is run
+# sudo bin/ms.sh /data/CircadianPipeline/KyleRes/MetaScape_Input/CPonly.job
+#shut down the container
+sudo bin/down.sh
+```
+
+
+```{r}
+hist(DCP_dR2$p.R2, breaks = seq(0, 1, 0.05))
+p = ggplot(data.frame(x = DCP_dR2$p.R2), aes(x = x))+
+  geom_histogram(color = "white", breaks=seq(0, 1, 0.05))+
+  theme_bw()+
+  xlab("p-value")+
+  ggtitle("Histogram of p-values of the DRF test")+
+  theme(axis.text.x = element_text(size = 14))
+
+pdf("Figure/TOJR_0.05_dR2_pval_histogram.pdf", height = 4, width = 4)
+print(p)
+dev.off()
+```
+
+```{r}
+m.res = mget(load("DCP_output.rData"))
+DRtable = DiffCircaPipeline::SummarizeDR(result = list(m.res$DCP_dparam2$pvalue, m.res$DCP_dR2$p.R2, m.res$DCP_dR2$p.R2, m.res$DCP_dR2$p.R2, m.res$DCP_dR2$q.R2),
+            test = c("phase", rep("DRF", 3), "DRF"),
+            type = c(rep("p-value", 4), "q-value"),
+            val = c(0.05, 0.1, 0.05, 0.01, 0.3))
+DRtable = DRtable[, c(2, 3, 1)]
+pdf(paste0("Figure/ByGene_DRresult.pdf"), width = 5)
+p<-gridExtra::tableGrob(DRtable, rows = NULL)
+gridExtra::grid.arrange(p)
+dev.off()
+```
+
